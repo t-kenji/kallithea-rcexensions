@@ -239,7 +239,7 @@ def _pullrequests_update_merge_test(**kwargs):
         )
         Session().commit()
 
-    user = User.guess_instance('kerberos', callback = User.get_by_username)
+    user = User.guess_instance('kerberos_merge', callback = User.get_by_username)
     branches = { re.sub(r'\w+=>', '', rev) for rev in kwargs['pushed_revs'] }
     for pr in PullRequest.query().filter().all():
         if re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.other_ref) in branches:
@@ -302,21 +302,30 @@ PULL_HOOK = _pullhook
 # CREATE PULLREQUEST HOOK
 #==============================================================================
 
-def _pullrequest_merge_test(**kwargs):
+def _pullrequest_merge_and_cppcheck(**kwargs):
     import re
+    import os.path
     from kallithea import CONFIG
-    from kallithea.lib.vcs.exceptions import RepositoryError
+    from kallithea.lib import diffs
+    from kallithea.lib.diffs import LimitedDiffContainer
     from kallithea.lib.vcs.backends.git import GitRepository
-    from kallithea.model.db import User, Repository, PullRequest, \
-            PullRequestReviewers, ChangesetStatus
+    from kallithea.lib.vcs.exceptions import ChangesetDoesNotExistError, \
+            RepositoryError
+    from kallithea.lib.vcs.subprocessio import SubprocessIOChunker
     from kallithea.model.comment import ChangesetCommentsModel
     from kallithea.model.changeset_status import ChangesetStatusModel
+    from kallithea.model.db import User, Repository, PullRequest, \
+            PullRequestReviewers, ChangesetStatus
     from kallithea.model.meta import Session
 
-    user = User.guess_instance('kerberos',
+    merge_user = User.guess_instance('kerberos_merge',
+            callback = User.get_by_username)
+    analyze_user = User.guess_instance('kerberos_analyze',
             callback = User.get_by_username)
     pr = PullRequest.guess_instance(kwargs['pr_nice_id'].replace('#', ''))
-    prr = PullRequestReviewers(user, pr)
+    prr = PullRequestReviewers(merge_user, pr)
+    Session().add(prr)
+    prr = PullRequestReviewers(analyze_user, pr)
     Session().add(prr)
 
     src_repo_path = '{}/{}'.format(CONFIG.get('base_path', ''), kwargs['repo_name'])
@@ -339,8 +348,11 @@ def _pullrequest_merge_test(**kwargs):
             return False, '', err
 
     _git([ 'fetch', 'origin' ])
+    _git([ 'rebase', 'origin' ])
+
+    # merge check
     _git([ 'checkout', '-b', local_target_branch, remote_target_branch, ])
-    ret, out, err = _git([ 'merge', '--no-commit', remote_source_branch, ])
+    ret, out, err = _git([ 'merge', remote_source_branch, ])
     if ret:
         comment = u'{} へのマージに成功しました。'.format(kwargs['pr_target_branch'])
         status = ChangesetStatus.STATUS_APPROVED
@@ -348,20 +360,102 @@ def _pullrequest_merge_test(**kwargs):
         _git([ 'merge', '--abort', ])
         comment = u'{} へのマージに失敗しました。以下のエラーを解消してください。\n\n{}'.format(kwargs['pr_target_branch'], err)
         status = ChangesetStatus.STATUS_REJECTED
-    _git([ 'checkout', 'master', ])
-    _git([ 'branch', '-D', local_target_branch, ])
 
     comment = ChangesetCommentsModel().create(
         text = comment,
         repo = pr.org_repo_id,
-        author = user.user_id,
+        author = merge_user.user_id,
         pull_request = pr.pull_request_id,
         status_change = status,
     )
     ChangesetStatusModel().set_status(
         pr.org_repo_id,
         status,
-        user.user_id,
+        merge_user.user_id,
+        comment,
+        pull_request = pr.pull_request_id
+    )
+    if status == ChangesetStatus.STATUS_REJECTED:
+        _git([ 'checkout', 'master', ])
+        _git([ 'branch', '-D', local_target_branch, ])
+        return
+
+    # cppcheck
+    try:
+        txtdiff = repo.get_diff(kwargs['pr_target_branch'], local_target_branch)
+    except ChangesetDoesNotExistError:
+        txtdiff = ''
+    diff_processor = diffs.DiffProcessor(txtdiff or '', format = 'gitdiff')
+    _parsed = diff_processor.prepare()
+    files = {}
+    for f in _parsed:
+        if re.match(r'\.(:?c|cpp|h|hpp)', os.path.splitext(f['filename'])[1]):
+            for chunk in f['chunks']:
+                lines = [ l['new_lineno'] for l in chunk if l['new_lineno'] > 0 and l['action'] == 'add' ]
+                files.update({ f['filename']: lines })
+
+    def _parse_cppcheck_result(message):
+        outs = []
+        for l in message.split('\n'):
+            matches = re.match(r'\[[\w\-/\.]+:(?P<lineno>\d+)\]: \((?P<id>\w+)\) (?P<message>.+)', l)
+            if matches is not None:
+                outs.append({
+                    'lineno': int(matches.group('lineno')),
+                    'id': matches.group('id'),
+                    'message': matches.group('message'),
+                })
+        return outs
+
+    status = ChangesetStatus.STATUS_APPROVED
+    for k, v in files.items():
+        try:
+            #cmd = [ 'cppcheck', '--check-config', '--enable=all', '--error-exitcode=1', '{}/{}'.format(tmp_repo_path, k), ]
+            cmd = [ 'cppcheck' ]
+            #configs = [ '--check-config', '--enable=all', '--error-exitcode=1' ]
+            configs = [ '--enable=all', '--error-exitcode=1' ]
+            includes = [ '-I/usr/include', '-I/usr/include/x86_64-linux-gnu' ]
+            cmd.extend(configs)
+            cmd.extend(includes)
+            cmd.extend([ '{}/{}'.format(tmp_repo_path, k) ])
+            _opts = {
+                'env': os.environ,
+                'shell': False,
+            }
+            rc = SubprocessIOChunker(cmd, **_opts)
+            print('*** out: {}, err: {} ***'.format(''.join(rc.output), ''.join(rc.error)))
+        except (EnvironmentError, OSError) as exc:
+            print('*** exc: {} ***'.format(exc))
+            results = _parse_cppcheck_result(str(exc))
+            for result in results:
+                if result['lineno'] in v:
+                    ChangesetCommentsModel().create(
+                        text = '({id}) {message}'.format(**result),
+                        repo = pr.org_repo_id,
+                        author = analyze_user.user_id,
+                        pull_request = pr.pull_request_id,
+                        f_path = k,
+                        line_no = 'n{lineno}'.format(**result),
+                    )
+
+                    if result['id'] == 'error':
+                        status = ChangesetStatus.STATUS_REJECTED
+
+    if status == ChangesetStatus.STATUS_APPROVED:
+        comment = u'差分の静的解析で新たなエラーは検出されませんでした。'
+    else:
+        comment = u'差分の静的解析で新たなエラーが検出されました。'
+
+    comment = ChangesetCommentsModel().create(
+        text = comment,
+        repo = pr.org_repo_id,
+        author = analyze_user.user_id,
+        pull_request = pr.pull_request_id,
+        status_change = status,
+    )
+    ChangesetStatusModel().set_status(
+        pr.org_repo_id,
+        status,
+        analyze_user.user_id,
         comment,
         pull_request = pr.pull_request_id
     )
@@ -385,7 +479,7 @@ def _create_pullrequest_hook(*args, **kwargs):
       :param threading:
     """
     handlers = [
-        _pullrequest_merge_test,
+        _pullrequest_merge_and_cppcheck,
     ]
     for handler in handlers:
         handler(**kwargs)
