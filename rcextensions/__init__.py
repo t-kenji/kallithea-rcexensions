@@ -27,6 +27,9 @@ INDEX_EXTENSIONS = []
 # those gets added to INDEX_EXTENSIONS
 EXTRA_INDEX_EXTENSIONS = []
 
+WORKSPACE = '/tmp/kallithea'
+
+
 def _make_random_string(length = 5):
     import string
     import random
@@ -178,7 +181,7 @@ DELETE_USER_HOOK = _dluserhook
 # POST PUSH HOOK
 #==============================================================================
 
-def _pullrequests_update_merge_test(**kwargs):
+def _pullrequests_merge_retest(**kwargs):
     import re
     from kallithea import CONFIG
     from kallithea.lib.vcs.exceptions import RepositoryError
@@ -189,11 +192,27 @@ def _pullrequests_update_merge_test(**kwargs):
     from kallithea.model.changeset_status import ChangesetStatusModel
     from kallithea.model.meta import Session
 
-    def _merge_test(**params):
-        src_repo_path = '{}/{}'.format(CONFIG.get('base_path', ''), params['repo_name'])
-        tmp_repo_path = '/tmp/kallithea/{}'.format(src_repo_path)
-        remote_source_branch = 'origin/{pr_source_branch}'.format(**params)
-        remote_target_branch = 'origin/{pr_target_branch}'.format(**params)
+    reviewer = User.guess_instance('kallitheabot', callback = User.get_by_username)
+    if reviewer is None:
+        return
+
+    src_repo_path = '{}/{}'.format(CONFIG.get('base_path', ''), kwargs['repository'])
+
+    def _git(repo, cmds):
+        try:
+            out, err = repo.run_git_command(cmds)
+            return True, out, err
+        except RepositoryError as exc:
+            err = '\n'.join(exc[0].split('\n')[2:])
+            print(err)
+            return False, '', err
+
+    def _merge_test(pr):
+        tmp_repo_path = '{}/{}'.format(WORKSPACE, pr.pull_request_id)
+        pr_source_branch = re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.org_ref)
+        pr_target_branch = re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.other_ref)
+        remote_source_branch = 'origin/{}'.format(pr_source_branch)
+        remote_target_branch = 'origin/{}'.format(pr_target_branch)
         local_target_branch = _make_random_string()
 
         try:
@@ -201,31 +220,23 @@ def _pullrequests_update_merge_test(**kwargs):
         except:
             repo = GitRepository(tmp_repo_path, True, src_repo_path, True)
 
-        def _git(cmds):
-            try:
-                out, err = repo.run_git_command(cmds)
-                return True, out, err
-            except RepositoryError as exc:
-                err = '\n'.join(exc[0].split('\n')[2:])
-                return False, '', err
-
-        _git([ 'fetch', 'origin' ])
-        _git([ 'checkout', '-b', local_target_branch, remote_target_branch, ])
-        ret, out, err = _git([ 'merge', '--no-commit', remote_source_branch, ])
+        _git(repo, [ 'fetch', 'origin' ])
+        _git(repo, [ 'checkout', '-b', local_target_branch, remote_target_branch, ])
+        ret, out, err = _git(repo, [ 'merge', '--no-commit', remote_source_branch, ])
         if ret:
-            comment = u'{} へのマージに成功しました。'.format(params['pr_target_branch'])
+            comment = u'{} が更新されましたが、マージに成功しました。'.format(pr_target_branch)
             status = ChangesetStatus.STATUS_APPROVED
         else:
-            _git([ 'merge', '--abort', ])
-            comment = u'{} へのマージに失敗しました。以下のエラーを解消してください。\n\n{}'.format(params['pr_target_branch'], err)
+            _git(repo, [ 'merge', '--abort', ])
+            comment = u'{} が更新され、マージに失敗しました。以下のエラーを解消してください。\n\n{}'.format(pr_target_branch, err)
             status = ChangesetStatus.STATUS_REJECTED
-        _git([ 'checkout', 'master', ])
-        _git([ 'branch', '-D', local_target_branch, ])
+        _git(repo, [ 'checkout', 'master', ])
+        _git(repo, [ 'branch', '-D', local_target_branch, ])
 
         comment = ChangesetCommentsModel().create(
             text = comment,
             repo = pr.org_repo_id,
-            author = user.user_id,
+            author = reviewer.user_id,
             pull_request = pr.pull_request_id,
             status_change = status,
             send_email = False,
@@ -233,22 +244,28 @@ def _pullrequests_update_merge_test(**kwargs):
         ChangesetStatusModel().set_status(
             pr.org_repo_id,
             status,
-            user.user_id,
+            reviewer.user_id,
             comment,
             pull_request = pr.pull_request_id
         )
         Session().commit()
 
-    user = User.guess_instance('kerberos_merge', callback = User.get_by_username)
-    branches = { re.sub(r'\w+=>', '', rev) for rev in kwargs['pushed_revs'] }
+    repo = GitRepository(src_repo_path)
+    
+    # collect pushed branches
+    branches = []
+    revs= [ rev for rev in kwargs['pushed_revs'] if re.match(r'^[\w\-/]+$', rev) ]
+    for rev in revs:
+        ret, out, err = _git(repo, [ 'branch', '--contains', rev ])
+        if ret:
+            match = re.search(r'[\w\-/]+', out)
+            if match:
+                branches.append(match.group())
+
     for pr in PullRequest.query().filter().all():
+        print('pr.other_ref: {}'.format(pr.other_ref))
         if re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.other_ref) in branches:
-            params = {
-                'repo_name': kwargs['repository'],
-                'pr_source_branch': re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.org_ref),
-                'pr_target_branch': re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.other_ref),
-            }
-            _merge_test(**params)
+            _merge_test(pr)
 
 # this function will be executed after each push it's executed after the
 # build-in hook that Kallithea uses for logging pushes
@@ -267,7 +284,7 @@ def _pushhook(*args, **kwargs):
       :param pushed_revs: list of pushed revisions
     """
     handlers = [
-        _pullrequests_update_merge_test,
+        _pullrequests_merge_retest,
     ]
     for handler in handlers:
         handler(**kwargs)
@@ -302,163 +319,71 @@ PULL_HOOK = _pullhook
 # CREATE PULLREQUEST HOOK
 #==============================================================================
 
-def _pullrequest_merge_and_cppcheck(**kwargs):
+def _pullrequest_merge_test(**kwargs):
     import re
     import os.path
     from kallithea import CONFIG
-    from kallithea.lib import diffs
-    from kallithea.lib.diffs import LimitedDiffContainer
     from kallithea.lib.vcs.backends.git import GitRepository
-    from kallithea.lib.vcs.exceptions import ChangesetDoesNotExistError, \
-            RepositoryError
-    from kallithea.lib.vcs.subprocessio import SubprocessIOChunker
+    from kallithea.lib.vcs.exceptions import RepositoryError
     from kallithea.model.comment import ChangesetCommentsModel
     from kallithea.model.changeset_status import ChangesetStatusModel
     from kallithea.model.db import User, Repository, PullRequest, \
             PullRequestReviewers, ChangesetStatus
     from kallithea.model.meta import Session
 
-    merge_user = User.guess_instance('kerberos_merge',
-            callback = User.get_by_username)
-    analyze_user = User.guess_instance('kerberos_analyze',
-            callback = User.get_by_username)
-    pr = PullRequest.guess_instance(kwargs['pr_nice_id'].replace('#', ''))
-    prr = PullRequestReviewers(merge_user, pr)
-    Session().add(prr)
-    prr = PullRequestReviewers(analyze_user, pr)
+    reviewer = User.guess_instance('kallitheabot', callback = User.get_by_username)
+    if reviewer is None:
+        return
+    pr_id = kwargs['pr_nice_id'].replace('#', '')
+    pr = PullRequest.guess_instance(pr_id)
+    prr = PullRequestReviewers(reviewer, pr)
     Session().add(prr)
 
     src_repo_path = '{}/{}'.format(CONFIG.get('base_path', ''), kwargs['repo_name'])
-    tmp_repo_path = '/tmp/kallithea/{}'.format(src_repo_path)
+    tmp_repo_path = '{}/{}'.format(WORKSPACE, pr_id)
     remote_source_branch = 'origin/{pr_source_branch}'.format(**kwargs)
     remote_target_branch = 'origin/{pr_target_branch}'.format(**kwargs)
     local_target_branch = _make_random_string()
 
-    try:
-        repo = GitRepository(tmp_repo_path)
-    except:
-        repo = GitRepository(tmp_repo_path, True, src_repo_path, True)
-
-    def _git(cmds):
+    def _git(repo, cmds):
         try:
             out, err = repo.run_git_command(cmds)
             return True, out, err
         except RepositoryError as exc:
             err = '\n'.join(exc[0].split('\n')[2:])
+            print(err)
             return False, '', err
 
-    _git([ 'fetch', 'origin' ])
-    _git([ 'rebase', 'origin' ])
+    repo = GitRepository(tmp_repo_path, True, src_repo_path, True)
 
-    # merge check
-    _git([ 'checkout', '-b', local_target_branch, remote_target_branch, ])
-    ret, out, err = _git([ 'merge', remote_source_branch, ])
+    _git(repo, [ 'checkout', '-b', local_target_branch, remote_target_branch, ])
+    ret, out, err = _git(repo, [ 'merge', remote_source_branch, ])
     if ret:
         comment = u'{} へのマージに成功しました。'.format(kwargs['pr_target_branch'])
         status = ChangesetStatus.STATUS_APPROVED
     else:
-        _git([ 'merge', '--abort', ])
+        _git(repo, [ 'merge', '--abort', ])
         comment = u'{} へのマージに失敗しました。以下のエラーを解消してください。\n\n{}'.format(kwargs['pr_target_branch'], err)
         status = ChangesetStatus.STATUS_REJECTED
 
     comment = ChangesetCommentsModel().create(
         text = comment,
         repo = pr.org_repo_id,
-        author = merge_user.user_id,
+        author = reviewer.user_id,
         pull_request = pr.pull_request_id,
         status_change = status,
     )
     ChangesetStatusModel().set_status(
         pr.org_repo_id,
         status,
-        merge_user.user_id,
+        reviewer.user_id,
         comment,
         pull_request = pr.pull_request_id
     )
     if status == ChangesetStatus.STATUS_REJECTED:
-        _git([ 'checkout', 'master', ])
-        _git([ 'branch', '-D', local_target_branch, ])
+        _git(repo, [ 'checkout', 'master', ])
+        _git(repo, [ 'branch', '-D', local_target_branch, ])
         return
-
-    # cppcheck
-    try:
-        txtdiff = repo.get_diff(kwargs['pr_target_branch'], local_target_branch)
-    except ChangesetDoesNotExistError:
-        txtdiff = ''
-    diff_processor = diffs.DiffProcessor(txtdiff or '', format = 'gitdiff')
-    _parsed = diff_processor.prepare()
-    files = {}
-    for f in _parsed:
-        if re.match(r'\.(:?c|cpp|h|hpp)', os.path.splitext(f['filename'])[1]):
-            for chunk in f['chunks']:
-                lines = [ l['new_lineno'] for l in chunk if l['new_lineno'] > 0 and l['action'] == 'add' ]
-                files.update({ f['filename']: lines })
-
-    def _parse_cppcheck_result(message):
-        outs = []
-        for l in message.split('\n'):
-            matches = re.match(r'\[[\w\-/\.]+:(?P<lineno>\d+)\]: \((?P<id>\w+)\) (?P<message>.+)', l)
-            if matches is not None:
-                outs.append({
-                    'lineno': int(matches.group('lineno')),
-                    'id': matches.group('id'),
-                    'message': matches.group('message'),
-                })
-        return outs
-
-    status = ChangesetStatus.STATUS_APPROVED
-    for k, v in files.items():
-        try:
-            #cmd = [ 'cppcheck', '--check-config', '--enable=all', '--error-exitcode=1', '{}/{}'.format(tmp_repo_path, k), ]
-            cmd = [ 'cppcheck' ]
-            #configs = [ '--check-config', '--enable=all', '--error-exitcode=1' ]
-            configs = [ '--enable=all', '--error-exitcode=1' ]
-            includes = [ '-I/usr/include', '-I/usr/include/x86_64-linux-gnu' ]
-            cmd.extend(configs)
-            cmd.extend(includes)
-            cmd.extend([ '{}/{}'.format(tmp_repo_path, k) ])
-            _opts = {
-                'env': os.environ,
-                'shell': False,
-            }
-            rc = SubprocessIOChunker(cmd, **_opts)
-            print('*** out: {}, err: {} ***'.format(''.join(rc.output), ''.join(rc.error)))
-        except (EnvironmentError, OSError) as exc:
-            print('*** exc: {} ***'.format(exc))
-            results = _parse_cppcheck_result(str(exc))
-            for result in results:
-                if result['lineno'] in v:
-                    ChangesetCommentsModel().create(
-                        text = '({id}) {message}'.format(**result),
-                        repo = pr.org_repo_id,
-                        author = analyze_user.user_id,
-                        pull_request = pr.pull_request_id,
-                        f_path = k,
-                        line_no = 'n{lineno}'.format(**result),
-                    )
-
-                    if result['id'] == 'error':
-                        status = ChangesetStatus.STATUS_REJECTED
-
-    if status == ChangesetStatus.STATUS_APPROVED:
-        comment = u'差分の静的解析で新たなエラーは検出されませんでした。'
-    else:
-        comment = u'差分の静的解析で新たなエラーが検出されました。'
-
-    comment = ChangesetCommentsModel().create(
-        text = comment,
-        repo = pr.org_repo_id,
-        author = analyze_user.user_id,
-        pull_request = pr.pull_request_id,
-        status_change = status,
-    )
-    ChangesetStatusModel().set_status(
-        pr.org_repo_id,
-        status,
-        analyze_user.user_id,
-        comment,
-        pull_request = pr.pull_request_id
-    )
 
 def _create_pullrequest_hook(*args, **kwargs):
     """
@@ -479,7 +404,7 @@ def _create_pullrequest_hook(*args, **kwargs):
       :param threading:
     """
     handlers = [
-        _pullrequest_merge_and_cppcheck,
+        _pullrequest_merge_test,
     ]
     for handler in handlers:
         handler(**kwargs)
