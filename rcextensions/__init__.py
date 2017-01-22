@@ -262,7 +262,7 @@ def _pullrequests_merge_retest(**kwargs):
             if match:
                 branches.append(match.group())
 
-    for pr in PullRequest.query().filter().all():
+    for pr in PullRequest.query(include_closed=False).filter().all():
         print('pr.other_ref: {}'.format(pr.other_ref))
         if re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.other_ref) in branches:
             _merge_test(pr)
