@@ -227,11 +227,19 @@ def _pullrequests_merge_retest(**kwargs):
             comment = u'{} が更新されましたが、マージに成功しました。'.format(pr_target_branch)
             status = ChangesetStatus.STATUS_APPROVED
         else:
-            _git(repo, [ 'merge', '--abort', ])
             comment = u'{} が更新され、マージに失敗しました。以下のエラーを解消してください。\n\n{}'.format(pr_target_branch, err)
             status = ChangesetStatus.STATUS_REJECTED
+        _git(repo, [ 'merge', '--abort', ])
         _git(repo, [ 'checkout', 'master', ])
         _git(repo, [ 'branch', '-D', local_target_branch, ])
+
+        cs_statuses = dict()
+        for st in reversed(ChangesetStatusModel().get_statuses(pr.org_repo,
+                                                               pull_request = pr,
+                                                               with_revisions = True)):
+            cs_statuses[st.author.username] = st
+        if cs_statuses[reviewer.username].status == status:
+            return
 
         comment = ChangesetCommentsModel().create(
             text = comment,
