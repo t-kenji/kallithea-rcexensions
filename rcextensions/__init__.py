@@ -291,11 +291,14 @@ def _pushhook(*args, **kwargs):
       :param repository: repository name
       :param pushed_revs: list of pushed revisions
     """
+    """
     handlers = [
         _pullrequests_merge_retest,
     ]
     for handler in handlers:
         handler(**kwargs)
+    """
+    print('_pushhook: {}'.format(kwargs))
     return 0
 PUSH_HOOK = _pushhook
 
@@ -319,6 +322,7 @@ def _pullhook(*args, **kwargs):
       :param action: pull
       :param repository: repository name
     """
+    print('_pullhook: {}'.format(kwargs))
     return 0
 PULL_HOOK = _pullhook
 
@@ -411,11 +415,14 @@ def _create_pullrequest_hook(*args, **kwargs):
       :param pr_username:
       :param threading:
     """
+    """
     handlers = [
         _pullrequest_merge_test,
     ]
     for handler in handlers:
         handler(**kwargs)
+    """
+    print('_create_pullrequest_hook: {}'.format(kwargs))
     return 0
 CREATE_PULLREQUEST_HOOK = _create_pullrequest_hook
 
@@ -423,10 +430,6 @@ CREATE_PULLREQUEST_HOOK = _create_pullrequest_hook
 #==============================================================================
 # ADD CHANGESET COMMENT HOOK
 #==============================================================================
-
-def _heimdall_add_changeset_comment_hook_handler(**kwargs):
-    from heimdall.api import GetRepository
-    print(kwargs)
 
 def _add_changeset_comment_hook(*args, **kwargs):
     """
@@ -448,11 +451,7 @@ def _add_changeset_comment_hook(*args, **kwargs):
       :param comment_username:
       :param threading:
     """
-    handlers = [
-        _heimdall_add_changeset_comment_hook_handler,
-    ]
-    for handler in handlers:
-        handler(**kwargs)
+    print('_add_changeset_comment_hook: {}'.format(kwargs))
     return 0
 ADD_CHANGESET_COMMENT_HOOK = _add_changeset_comment_hook
 
@@ -460,10 +459,6 @@ ADD_CHANGESET_COMMENT_HOOK = _add_changeset_comment_hook
 #==============================================================================
 # ADD PULLREQUEST COMMENT HOOK
 #==============================================================================
-
-def _heimdall_add_pullrequest_comment_hook_handler(**kwargs):
-    from heimdall.api import GetRepository
-    print(kwargs)
 
 def _add_pullrequest_comment_hook(*args, **kwargs):
     """
@@ -486,11 +481,7 @@ def _add_pullrequest_comment_hook(*args, **kwargs):
       :param comment_username:
       :param threading:
     """
-    handlers = [
-        _heimdall_add_pullrequest_comment_hook_handler,
-    ]
-    for handler in handlers:
-        handler(**kwargs)
+    print('_add_pullrequest_comment_hook: {}'.format(kwargs))
     return 0
 ADD_PULLREQUEST_COMMENT_HOOK = _add_pullrequest_comment_hook
 
