@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
 
+import logging
+import re
+import requests
+
+from pylons.i18n.translation import _
+
+from kallithea.model.db import Repository
+from kallithea.lib import helpers as h
+
+log = logging.getLogger(__name__)
+
+
 # Additional mappings that are not present in the pygments lexers
 # used for building stats
 # format is {'ext':['Names']} eg. {'py':['Python']} note: there can be
@@ -27,13 +39,28 @@ INDEX_EXTENSIONS = []
 # those gets added to INDEX_EXTENSIONS
 EXTRA_INDEX_EXTENSIONS = []
 
-WORKSPACE = '/tmp/kallithea'
+#==============================================================================
+# Let's Chat Params
+#==============================================================================
+KALLITHEA_LCB_HOST = 'letschat'
+KALLITHEA_LCB_PORT = 5000
+KALLITHEA_LCB_TOKEN = 'YOUR_TOKEN'
 
 
-def _make_random_string(length = 5):
-    import string
-    import random
-    return ''.join([random.choice(string.ascii_letters + string.digits) for i in range(length)])
+def letschat_post_message(room, text):
+    url_params = dict(
+        host=KALLITHEA_LCB_HOST,
+        port=KALLITHEA_LCB_PORT,
+        room=room,
+    )
+    try:
+        requests.post('http://{host}:{port}/rooms/{room}/messages'.format(**url_params),
+                      data={'text': text},
+                      auth=(KALLITHEA_LCB_TOKEN, 'dummy'),
+                      timeout=1.0)
+    except requests.exceptions.RequestException:
+        return False
+    return True
 
 #==============================================================================
 # POST CREATE REPOSITORY HOOK
@@ -50,7 +77,7 @@ def _crrepohook(*args, **kwargs):
      :param created_on:
      :param enable_downloads:
      :param repo_id:
-     :param owner_id:
+     :param user_id:
      :param enable_statistics:
      :param clone_uri:
      :param fork_id:
@@ -132,7 +159,7 @@ def _dlrepohook(*args, **kwargs):
      :param created_on:
      :param enable_downloads:
      :param repo_id:
-     :param owner_id:
+     :param user_id:
      :param enable_statistics:
      :param clone_uri:
      :param fork_id:
@@ -181,100 +208,6 @@ DELETE_USER_HOOK = _dluserhook
 # POST PUSH HOOK
 #==============================================================================
 
-def _pullrequests_merge_retest(**kwargs):
-    import re
-    from kallithea import CONFIG
-    from kallithea.lib.vcs.exceptions import RepositoryError
-    from kallithea.lib.vcs.backends.git import GitRepository
-    from kallithea.model.db import User, Repository, PullRequest, \
-            PullRequestReviewers, ChangesetStatus
-    from kallithea.model.comment import ChangesetCommentsModel
-    from kallithea.model.changeset_status import ChangesetStatusModel
-    from kallithea.model.meta import Session
-
-    reviewer = User.guess_instance('kallitheabot', callback = User.get_by_username)
-    if reviewer is None:
-        return
-
-    src_repo_path = '{}/{}'.format(CONFIG.get('base_path', ''), kwargs['repository'])
-
-    def _git(repo, cmds):
-        try:
-            out, err = repo.run_git_command(cmds)
-            return True, out, err
-        except RepositoryError as exc:
-            err = '\n'.join(exc[0].split('\n')[2:])
-            print(err)
-            return False, '', err
-
-    def _merge_test(pr):
-        tmp_repo_path = '{}/{}'.format(WORKSPACE, pr.pull_request_id)
-        pr_source_branch = re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.org_ref)
-        pr_target_branch = re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.other_ref)
-        remote_source_branch = 'origin/{}'.format(pr_source_branch)
-        remote_target_branch = 'origin/{}'.format(pr_target_branch)
-        local_target_branch = _make_random_string()
-
-        try:
-            repo = GitRepository(tmp_repo_path)
-        except:
-            repo = GitRepository(tmp_repo_path, True, src_repo_path, True)
-
-        _git(repo, [ 'fetch', 'origin' ])
-        _git(repo, [ 'checkout', '-b', local_target_branch, remote_target_branch, ])
-        ret, out, err = _git(repo, [ 'merge', '--no-commit', remote_source_branch, ])
-        if ret:
-            comment = u'{} が更新されましたが、マージに成功しました。'.format(pr_target_branch)
-            status = ChangesetStatus.STATUS_APPROVED
-        else:
-            comment = u'{} が更新され、マージに失敗しました。以下のエラーを解消してください。\n\n{}'.format(pr_target_branch, err)
-            status = ChangesetStatus.STATUS_REJECTED
-        _git(repo, [ 'merge', '--abort', ])
-        _git(repo, [ 'checkout', 'master', ])
-        _git(repo, [ 'branch', '-D', local_target_branch, ])
-
-        cs_statuses = dict()
-        for st in reversed(ChangesetStatusModel().get_statuses(pr.org_repo,
-                                                               pull_request = pr,
-                                                               with_revisions = True)):
-            cs_statuses[st.author.username] = st
-        if cs_statuses[reviewer.username].status == status:
-            return
-
-        comment = ChangesetCommentsModel().create(
-            text = comment,
-            repo = pr.org_repo_id,
-            author = reviewer.user_id,
-            pull_request = pr.pull_request_id,
-            status_change = status,
-            send_email = False,
-        )
-        ChangesetStatusModel().set_status(
-            pr.org_repo_id,
-            status,
-            reviewer.user_id,
-            comment,
-            pull_request = pr.pull_request_id
-        )
-        Session().commit()
-
-    repo = GitRepository(src_repo_path)
-    
-    # collect pushed branches
-    branches = []
-    revs= [ rev for rev in kwargs['pushed_revs'] if re.match(r'^[\w\-/]+$', rev) ]
-    for rev in revs:
-        ret, out, err = _git(repo, [ 'branch', '--contains', rev ])
-        if ret:
-            match = re.search(r'[\w\-/]+', out)
-            if match:
-                branches.append(match.group())
-
-    for pr in PullRequest.query(include_closed=False).filter().all():
-        print('pr.other_ref: {}'.format(pr.other_ref))
-        if re.sub(r'branch:([\w\-/]+):\w+', r'\1', pr.other_ref) in branches:
-            _merge_test(pr)
-
 # this function will be executed after each push it's executed after the
 # build-in hook that Kallithea uses for logging pushes
 def _pushhook(*args, **kwargs):
@@ -291,14 +224,37 @@ def _pushhook(*args, **kwargs):
       :param repository: repository name
       :param pushed_revs: list of pushed revisions
     """
-    """
-    handlers = [
-        _pullrequests_merge_retest,
-    ]
-    for handler in handlers:
-        handler(**kwargs)
-    """
-    print('_pushhook: {}'.format(kwargs))
+    def _letschat_push_notify(server_url, repository, **kwargs):
+        repo = Repository.get_by_repo_name(repository)
+        repo_data = repo.get_api_data()
+        lcb_room = repo_data.get('ex_letschat_room', '')
+        if repo_data.get('ex_letschat_push_notify', '') == 'enabled' and len(lcb_room) > 0:
+            from kallithea.lib.vcs.exceptions import RepositoryError
+            from kallithea.lib.vcs.backends.git import GitRepository
+
+            texts = []
+            git_repo = GitRepository(repo.repo_full_path)
+            changeset_url_base = u'{}/{}/changeset'.format(server_url, repository)
+            revs = kwargs.get('pushed_revs', [])
+            for rev in revs:
+                branch_names = []
+                if re.match(r'^\w+$', rev):
+                    try:
+                        out, err = git_repo.run_git_command(['branch', '--contains', rev])
+                        branch_names = re.findall(r'[\w\-/]+', out)
+                    except RepositoryError as e:
+                        return -1
+                try:
+                    out, err = git_repo.run_git_command(['show', '--name-only', rev])
+                    text  = u'Push to {}\n'.format(','.join(branch_names))
+                    text += out
+                    text += u'\nChangeset URL: {}/{}'.format(changeset_url_base, rev)
+                    texts.append(text)
+                except RepositoryError as e:
+                    return -1
+            if len(texts) > 0:
+                return letschat_post_message(lcb_room, '\n----\n'.join(texts))
+    _letschat_push_notify(**kwargs)
     return 0
 PUSH_HOOK = _pushhook
 
@@ -322,7 +278,6 @@ def _pullhook(*args, **kwargs):
       :param action: pull
       :param repository: repository name
     """
-    print('_pullhook: {}'.format(kwargs))
     return 0
 PULL_HOOK = _pullhook
 
@@ -331,72 +286,6 @@ PULL_HOOK = _pullhook
 # CREATE PULLREQUEST HOOK
 #==============================================================================
 
-def _pullrequest_merge_test(**kwargs):
-    import re
-    import os.path
-    from kallithea import CONFIG
-    from kallithea.lib.vcs.backends.git import GitRepository
-    from kallithea.lib.vcs.exceptions import RepositoryError
-    from kallithea.model.comment import ChangesetCommentsModel
-    from kallithea.model.changeset_status import ChangesetStatusModel
-    from kallithea.model.db import User, Repository, PullRequest, \
-            PullRequestReviewers, ChangesetStatus
-    from kallithea.model.meta import Session
-
-    reviewer = User.guess_instance('kallitheabot', callback = User.get_by_username)
-    if reviewer is None:
-        return
-    pr_id = kwargs['pr_nice_id'].replace('#', '')
-    pr = PullRequest.guess_instance(pr_id)
-    prr = PullRequestReviewers(reviewer, pr)
-    Session().add(prr)
-
-    src_repo_path = '{}/{}'.format(CONFIG.get('base_path', ''), kwargs['repo_name'])
-    tmp_repo_path = '{}/{}'.format(WORKSPACE, pr_id)
-    remote_source_branch = 'origin/{pr_source_branch}'.format(**kwargs)
-    remote_target_branch = 'origin/{pr_target_branch}'.format(**kwargs)
-    local_target_branch = _make_random_string()
-
-    def _git(repo, cmds):
-        try:
-            out, err = repo.run_git_command(cmds)
-            return True, out, err
-        except RepositoryError as exc:
-            err = '\n'.join(exc[0].split('\n')[2:])
-            print(err)
-            return False, '', err
-
-    repo = GitRepository(tmp_repo_path, True, src_repo_path, True)
-
-    _git(repo, [ 'checkout', '-b', local_target_branch, remote_target_branch, ])
-    ret, out, err = _git(repo, [ 'merge', remote_source_branch, ])
-    if ret:
-        comment = u'{} へのマージに成功しました。'.format(kwargs['pr_target_branch'])
-        status = ChangesetStatus.STATUS_APPROVED
-    else:
-        _git(repo, [ 'merge', '--abort', ])
-        comment = u'{} へのマージに失敗しました。以下のエラーを解消してください。\n\n{}'.format(kwargs['pr_target_branch'], err)
-        status = ChangesetStatus.STATUS_REJECTED
-
-    comment = ChangesetCommentsModel().create(
-        text = comment,
-        repo = pr.org_repo_id,
-        author = reviewer.user_id,
-        pull_request = pr.pull_request_id,
-        status_change = status,
-    )
-    ChangesetStatusModel().set_status(
-        pr.org_repo_id,
-        status,
-        reviewer.user_id,
-        comment,
-        pull_request = pr.pull_request_id
-    )
-    if status == ChangesetStatus.STATUS_REJECTED:
-        _git(repo, [ 'checkout', 'master', ])
-        _git(repo, [ 'branch', '-D', local_target_branch, ])
-        return
-
 def _create_pullrequest_hook(*args, **kwargs):
     """
     Create pull request hook
@@ -404,27 +293,84 @@ def _create_pullrequest_hook(*args, **kwargs):
 
       :param pr_title:
       :param pr_description:
-      :param pr_user_created:
-      :param pr_repo_url:
-      :param pr_url:
+      :param pr_created_by:
       :param pr_revisions:
-      :param repo_name:
-      :param repo_owners:
       :param pr_nice_id:
-      :param ref:
-      :param pr_username:
-      :param threading:
+      :param pr_url:
+      :param org_ref:
+      :param org_repo_name:
+      :param org_repo_owner:
+      :param other_ref:
+      :param other_repo_name:
+      :param other_repo_owner:
     """
-    """
-    handlers = [
-        _pullrequest_merge_test,
-    ]
-    for handler in handlers:
-        handler(**kwargs)
-    """
-    print('_create_pullrequest_hook: {}'.format(kwargs))
+    def _letschat_create_pullrequest_notify(pr_title,
+                                            pr_description,
+                                            pr_created_by,
+                                            pr_url,
+                                            pr_nice_id,
+                                            org_repo_name,
+                                            org_repo_owner,
+                                            other_repo_name,
+                                            other_repo_owner,
+                                            **kwargs):
+        repo = Repository.get_by_repo_name(other_repo_name)
+        repo_data = repo.get_api_data()
+        lcb_room = repo_data.get('ex_letschat_room', '')
+        if len(lcb_room) > 0:
+            owners = set((org_repo_owner, other_repo_owner))
+            mentions = [u for u in owners if u != pr_created_by]
+
+            text  = u'{} '.format(re.sub(r'([0-9a-z]+)', r'@\1', ' '.join(mentions)))
+            text += u'new {pr_nice_id} {pr_title} by {pr_created_by}\n'.format(
+                pr_nice_id=pr_nice_id, pr_title=pr_title, pr_created_by=pr_created_by)
+            text += u'<<Description>>\n{}\n'.format(pr_description)
+            text += u'PR URL: {}'.format(pr_url)
+            return letschat_post_message(lcb_room, text)
+    _letschat_create_pullrequest_notify(**kwargs)
     return 0
 CREATE_PULLREQUEST_HOOK = _create_pullrequest_hook
+
+
+#==============================================================================
+# ADD PULLREQUEST REVIEWER HOOK
+#==============================================================================
+
+def _add_pullrequest_reviewer_hook(*args, **kwargs):
+    """
+    Add pull request reviewer hook
+    kwargs available::
+
+      :param pr_title:
+      :param pr_description:
+      :param pr_created_by:
+      :param pr_revisions:
+      :param pr_added_reviewers:
+      :param pr_nice_id:
+      :param pr_url:
+      :param org_ref:
+      :param other_ref:
+      :param other_repo_name:
+    """
+    def _letschat_add_reviewer_notify(pr_title,
+                                      pr_created_by,
+                                      pr_added_reviewers,
+                                      pr_nice_id,
+                                      pr_url,
+                                      other_repo_name,
+                                      **kwargs):
+        repo = Repository.get_by_repo_name(other_repo_name)
+        repo_data = repo.get_api_data()
+        lcb_room = repo_data.get('ex_letschat_room', '')
+        if len(lcb_room) > 0:
+            text  = u'{} '.format(re.sub(r'([0-9a-z]+)', r'@\1', ' '.join(pr_added_reviewers)))
+            text += u'prease review the {pr_nice_id} by {pr_created_by}: {pr_title}\n'.format(
+                pr_nice_id=pr_nice_id, pr_created_by=pr_created_by, pr_title=pr_title)
+            text += u'PR URL: {}'.format(pr_url)
+            return letschat_post_message(lcb_room, text)
+    _letschat_add_reviewer_notify(**kwargs)
+    return 0
+ADD_PULLREQUEST_REVIEWER_HOOK = _add_pullrequest_reviewer_hook
 
 
 #==============================================================================
@@ -440,18 +386,38 @@ def _add_changeset_comment_hook(*args, **kwargs):
       :param line_no:
       :param status_change:
       :param comment_user:
-      :param target_repo:
       :param comment_url:
       :param raw_id:
-      :param message:
       :param repo_name:
       :param repo_owner:
-      :param short_id:
       :param branch:
-      :param comment_username:
-      :param threading:
     """
-    print('_add_changeset_comment_hook: {}'.format(kwargs))
+    def _letschat_changeset_comment_notify(comment,
+                                           line_no,
+                                           comment_user,
+                                           comment_url,
+                                           raw_id,
+                                           repo_name,
+                                           repo_owner,
+                                           branch,
+                                           **kwargs):
+        repo = Repository.get_by_repo_name(repo_name)
+        repo_data = repo.get_api_data()
+        lcb_room = repo_data.get('ex_letschat_room', '')
+        if len(lcb_room) > 0:
+            text  = u''
+            if comment_user != repo_owner:
+                text += u'@{} '.format(repo_owner)
+            if line_no:
+                text += u'add comment to changeset {short_id} on line {line_no} on {branch} by {commented_by}\n'.format(
+                    short_id=h.short_id(raw_id), line_no=line_no, branch=branch, commented_by=comment_user)
+            else:
+                text += u'add comment to changeset {short_id} on {branch} by {commented_by}\n'.format(
+                    short_id=h.short_id(raw_id), branch=branch, commented_by=comment_user)
+            text += u'<<Comment>>\n{}\n'.format(comment)
+            text += u'Comment URL: {}'.format(comment_url)
+            return letschat_post_message(lcb_room, text)
+    _letschat_changeset_comment_notify(**kwargs)
     return 0
 ADD_CHANGESET_COMMENT_HOOK = _add_changeset_comment_hook
 
@@ -467,48 +433,46 @@ def _add_pullrequest_comment_hook(*args, **kwargs):
 
       :param comment:
       :param line_no:
+      :param status_change:
+      :param comment_user:
+      :param comment_url:
+      :param org_ref:
+      :param org_repo_owner:
+      :param other_repo_name:
+      :param other_repo_owner:
       :param pr_title:
       :param pr_nice_id:
       :param pr_owner:
-      :param status_change:
       :param closing_pr:
-      :param comment_user:
-      :param target_repo:
-      :param comment_url:
-      :param repo_name:
-      :param repo_owners:
-      :param ref:
-      :param comment_username:
-      :param threading:
     """
-    print('_add_pullrequest_comment_hook: {}'.format(kwargs))
+    def _letschat_pullrequest_comment_notify(comment,
+                                             line_no,
+                                             comment_user,
+                                             comment_url,
+                                             org_repo_owner,
+                                             other_repo_name,
+                                             other_repo_owner,
+                                             pr_title,
+                                             pr_nice_id,
+                                             pr_owner,
+                                             **kwargs):
+        repo = Repository.get_by_repo_name(other_repo_name)
+        repo_data = repo.get_api_data()
+        lcb_room = repo_data.get('ex_letschat_room', '')
+        if len(lcb_room) > 0:
+            owners = set((org_repo_owner, other_repo_owner, pr_owner))
+            mentions = [u for u in owners if u != comment_user]
+
+            text  = u'{} '.format(re.sub(r'([0-9a-z]+)', r'@\1', ' '.join(mentions)))
+            if line_no:
+                text += u'add comment to pullrequest {pr_nice_id} on line {line_no} by {commented_by}: {pr_title}\n'.format(
+                    pr_nice_id=pr_nice_id, line_no=line_no, commented_by=comment_user, pr_title=pr_title)
+            else:
+                text += u'add comment to pullrequest {pr_nice_id} by {commented_by}: {pr_title}\n'.format(
+                    pr_nice_id=pr_nice_id, commented_by=comment_user, pr_title=pr_title)
+            text += u'<<Comment>>\n{}\n'.format(comment)
+            text += u'Comment URL: {}'.format(comment_url)
+            return letschat_post_message(lcb_room, text)
+    _letschat_pullrequest_comment_notify(**kwargs)
     return 0
 ADD_PULLREQUEST_COMMENT_HOOK = _add_pullrequest_comment_hook
-
-
-#==============================================================================
-# ADD PULLREQUEST REVIEWER HOOK
-#==============================================================================
-
-def _add_pullrequest_reviewer_hook(*args, **kwargs):
-    """
-    Add pull request reviewer hook
-    kwargs available::
-
-      :param pr_title:
-      :param pr_description:
-      :param pr_user_created:
-      :param pr_repo_url:
-      :param pr_url:
-      :param pr_revisions:
-      :param repo_name:
-      :param repo_owners:
-      :param pr_nice_id:
-      :param ref:
-      :param pr_username:
-      :param pr_add_reviewers:
-      :param threading:
-    """
-    print('*** _add_pullrequest_reviewer_hook: {} ***'.format(kwargs))
-    return 0
-ADD_PULLREQUEST_REVIEWER_HOOK = _add_pullrequest_reviewer_hook
