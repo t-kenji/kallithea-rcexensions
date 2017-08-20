@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import os
 import logging
 import re
 import requests
@@ -42,21 +43,21 @@ EXTRA_INDEX_EXTENSIONS = []
 #==============================================================================
 # Let's Chat Params
 #==============================================================================
-KALLITHEA_LCB_HOST = 'letschat'
-KALLITHEA_LCB_PORT = 5000
-KALLITHEA_LCB_TOKEN = 'YOUR_TOKEN'
+LCB_HOSTNAME = os.environ.get('KALLITHEA_LCB_HOSTNAME', 'letschat')
+LCB_PORT = os.environ.get('KALLITHEA_LCB_PORT', 5000)
+LCB_TOKEN = os.environ.get('KALLITHEA_LCB_TOKEN', '')
 
 
 def letschat_post_message(room, text):
     url_params = dict(
-        host=KALLITHEA_LCB_HOST,
-        port=KALLITHEA_LCB_PORT,
+        host=LCB_HOSTNAME,
+        port=LCB_PORT,
         room=room,
     )
     try:
         requests.post('http://{host}:{port}/rooms/{room}/messages'.format(**url_params),
                       data={'text': text},
-                      auth=(KALLITHEA_LCB_TOKEN, 'dummy'),
+                      auth=(LCB_TOKEN, 'dummy'),
                       timeout=1.0)
     except requests.exceptions.RequestException:
         return False
